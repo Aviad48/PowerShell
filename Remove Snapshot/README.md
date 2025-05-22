@@ -31,3 +31,25 @@ Clone the repository:
 git clone https://your-gitlab-or-github-url/aviadd/snapshot-remove.git
 cd snapshot-remove
 
+## Configuration
+
+Before running the script, ensure you review and update the following variables in the script:
+
+```powershell
+# ElasticSearch endpoint and API key
+$elasticHost = "https://your-elastic-url:9200"
+$datastream = "your-storage_stats-log"
+$apiKey = "your-api-key"
+
+# Snapshot age limit (in days) – snapshots older than this will be removed
+$SnapshotAgeLimit = (Get-Date).AddDays(-1)
+
+# Minimum free space (in TB) required after deletion
+$MinimumFreeSpaceTB = 10
+
+# Email configuration
+$SmtpServer = "smtp.example.com"
+$FromEmail = "snapshot-report@example.com"
+$ToEmail = "admin@example.com"
+
+
