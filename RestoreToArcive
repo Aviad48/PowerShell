@@ -1,0 +1,503 @@
+# ================================
+# CONFIG
+# ================================
+$BaseUrl      = "api url"
+$TemplatePath = "json path"
+$CsvPath      = "csv path"
+
+$LogRoot = "D:\Aviad\Scripts\Commvault\Log"
+$date = get-date -Format dd-MM-yyyy
+$InfoLog    = Join-Path $LogRoot "info-$date.log"
+$SuccessLog = Join-Path $LogRoot "success-$date.log"
+$FailedLog  = Join-Path $LogRoot "failed-$date.log"
+$SkippedLog = Join-Path $LogRoot "skipped-$date.log"
+$WarningLog = Join-Path $LogRoot "completed_with_warning-$date.log"
+
+# MAX PARALLEL RESTORES
+$MaxParallel = 5
+
+# AD GROUPS
+$GroupA = "ArchiveMail30"
+$GroupB = "Disabledusersarchive1"
+
+# ================================
+# INIT LOGS
+# ================================
+if (-not (Test-Path $LogRoot)) {
+    New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null
+}
+
+foreach ($log in @(
+    $InfoLog,
+    $SuccessLog,
+    $FailedLog,
+    $SkippedLog,
+    $WarningLog
+)) {
+
+    if (-not (Test-Path $log)) {
+        New-Item -ItemType File -Path $log -Force | Out-Null
+    }
+}
+
+# ================================
+# LOG FUNCTION
+# ================================
+function Write-Log {
+
+    param (
+        $file,
+        $msg
+    )
+
+    $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$time | $msg"
+
+    Write-Host $line
+
+    Add-Content `
+        -Path $file `
+        -Value $line `
+        -Encoding UTF8
+}
+
+# ================================
+# LOAD DATA
+# ================================
+$templateRaw = Get-Content $TemplatePath -Raw
+
+$users = Import-Csv $CsvPath | Where-Object {
+    $_.SAMACC -and $_.SAMACC.Trim() -ne ""
+}
+
+# REMOVE DUPLICATES
+$users = $users | Sort-Object SAMACC -Unique
+
+Import-Module ActiveDirectory
+
+function Get-ADUserStatus {
+
+    param ($SamAccountName)
+
+    try {
+
+        Get-ADUser `
+            -Identity $SamAccountName `
+            -Properties Enabled `
+            -ErrorAction Stop
+    }
+    catch {
+
+        return $null
+    }
+}
+
+# ================================
+# AD GROUP MOVE
+# ================================
+Write-Log $InfoLog "Loading members of $GroupA"
+
+$GroupAMembers = Get-ADGroupMember `
+    -Identity $GroupA `
+    -Recursive |
+    Select-Object -ExpandProperty SamAccountName
+
+$MoveSuccess = 0
+$MoveFailed  = 0
+
+foreach ($User in $users) {
+
+    $Sam = $User.SAMACC
+
+    if (-not $Sam) {
+
+        Write-Log $FailedLog "Empty SAMACC in CSV row"
+        continue
+    }
+
+    try {
+
+        $ADUser = Get-ADUser $Sam -ErrorAction Stop
+
+        # REMOVE FROM GROUP A
+        if ($GroupAMembers -contains $Sam) {
+
+            Remove-ADGroupMember `
+                -Identity $GroupA `
+                -Members $ADUser `
+                -Confirm:$false
+
+            Write-Log $InfoLog "Removed $Sam from $GroupA"
+        }
+        else {
+
+            Write-Log $InfoLog "$Sam not member of $GroupA"
+        }
+
+        # ADD TO GROUP B
+        Add-ADGroupMember `
+            -Identity $GroupB `
+            -Members $ADUser
+
+        Write-Log $InfoLog "Added $Sam to $GroupB"
+
+        $MoveSuccess++
+    }
+    catch {
+
+        Write-Log $FailedLog "Failed moving $Sam : $($_.Exception.Message)"
+
+        $MoveFailed++
+    }
+}
+
+Write-Log $InfoLog "AD Group Move Summary: Success=$MoveSuccess Failed=$MoveFailed"
+
+# ================================
+# LOGIN
+# ================================
+Write-Log $InfoLog "Logging in..."
+
+$LoginBody = @{
+    username = " user"
+    password = "Base64"
+} | ConvertTo-Json
+
+$token = (Invoke-RestMethod `
+    -Uri "$BaseUrl/Login" `
+    -Method POST `
+    -Headers @{
+        "Content-Type" = "application/json"
+        "Accept"       = "application/json"
+    } `
+    -Body $LoginBody).token
+
+Write-Log $InfoLog "Login successful"
+
+# ================================
+# SCRIPT BLOCK (CREATE JOB)
+# ================================
+$ScriptBlock = {
+
+    param (
+        $user,
+        $templateRaw,
+        $BaseUrl,
+        $token
+    )
+
+    function Convert-ToCommvaultId {
+
+        param ($guid)
+
+        $g = ($guid -replace '[^0-9a-fA-F]', '').ToUpper()
+
+        return "$($g.Substring(0,8))X$($g.Substring(8,4))X$($g.Substring(12,4))X$($g.Substring(16,4))X$($g.Substring(20))"
+    }
+
+    $heb  = $user.Hebuser
+    $sam  = $user.SAMACC
+    $mail = $user.Mail
+    $guid = $user.GUID
+
+    $userName = if ($heb) {
+        "$heb ($sam)"
+    }
+    else {
+        $sam
+    }
+
+    try {
+
+        $cvId = Convert-ToCommvaultId $guid
+
+        $json = $templateRaw
+        $json = $json.Replace("[Hebuser]", $heb)
+        $json = $json.Replace("[SAMACC]", $sam)
+        $json = $json.Replace("[Mail]", $mail)
+        $json = $json.Replace("{{GUID}}", "{${cvId}}")
+
+        $headers = @{
+            Authtoken      = $token
+            "Content-Type" = "application/json"
+            "Accept"       = "application/json"
+        }
+
+        $response = Invoke-RestMethod `
+            -Uri "$BaseUrl/CreateTask" `
+            -Method POST `
+            -Headers $headers `
+            -Body $json
+
+        if ($response.jobIds) {
+
+            return [PSCustomObject]@{
+                JobId    = $response.jobIds[0]
+                UserName = $userName
+            }
+        }
+    }
+    catch {
+
+        return $null
+    }
+}
+
+# ================================
+# MAIN PROCESSING
+# ================================
+$activeJobs = @()
+
+$userQueue = [System.Collections.Queue]::new()
+
+foreach ($u in $users) {
+    $userQueue.Enqueue($u)
+}
+
+$maxRetries = 30
+
+while ($userQueue.Count -gt 0 -or $activeJobs.Count -gt 0) {
+
+    # =========================================
+    # SUBMIT NEW JOBS
+    # =========================================
+    while ($activeJobs.Count -lt $MaxParallel -and $userQueue.Count -gt 0) {
+
+        $user = $userQueue.Dequeue()
+
+        $sam = $user.SAMACC
+        $heb = $user.Hebuser
+
+        $adUser = Get-ADUserStatus $sam
+
+        if ($null -eq $adUser) {
+
+            Write-Log $SkippedLog "SKIPPED: $heb ($sam) | User NOT FOUND"
+            continue
+        }
+
+        if (-not $adUser.Enabled) {
+
+            Write-Log $SkippedLog "SKIPPED: $heb ($sam) | Disabled"
+            continue
+        }
+
+        Write-Log $InfoLog "Submitting restore for $heb ($sam)"
+
+        $psJob = Start-Job `
+            -ScriptBlock $ScriptBlock `
+            -ArgumentList $user, $templateRaw, $BaseUrl, $token
+
+        Wait-Job $psJob | Out-Null
+
+        $result = Receive-Job $psJob
+
+        Remove-Job $psJob -Force
+
+        if ($result) {
+
+            $activeJobs += [PSCustomObject]@{
+                JobId    = $result.JobId
+                UserName = $result.UserName
+                Retry    = 0
+            }
+
+            Write-Log $InfoLog "RESTORE SUBMITTED: $($result.UserName) | Job=$($result.JobId)"
+        }
+        else {
+
+            Write-Log $FailedLog "FAILED TO SUBMIT: $heb ($sam)"
+        }
+    }
+
+    # =========================================
+    # TRACK ACTIVE JOBS
+    # =========================================
+    foreach ($job in @($activeJobs)) {
+
+        try {
+
+            $headers = @{
+                Authtoken      = $token
+                "Content-Type" = "application/json"
+                "Accept"       = "application/json"
+            }
+
+            $body = "{ `"jobId`": $($job.JobId) }"
+
+            $jd = (Invoke-RestMethod `
+                -Uri "$BaseUrl/JobDetails" `
+                -Method POST `
+                -Headers $headers `
+                -Body $body).job.jobDetail
+
+            $state        = $jd.progressInfo.state
+            $percent      = $jd.progressInfo.percentComplete
+            $reason       = $jd.progressInfo.reasonForJobDelay
+            $ItemFailed   = $jd.detailInfo.scanFileFailures
+
+            $startUnix = $jd.generalInfo.startTime
+            $endUnix   = $jd.detailInfo.endTime
+
+            $mail = $jd.detailInfo.xmlJobInfo.rstJobInfo.exchOnePass.restoreJob
+
+            $mailSuccess = $mail.mailboxesSuccessful
+            $mailFailed  = $mail.mailboxesFailed
+            $mailSkipped = $mail.mailboxesSkipped
+
+            $finalStatus = "UNKNOWN"
+            $isFinished  = $false
+
+            # =========================================
+            # COMPLETED WITH WARNING
+            # =========================================
+            if ($state -eq "Completed" -and $ItemFailed -gt 0) {
+
+                $finalStatus = "COMPLETED_WITH_WARNING"
+                $isFinished  = $true
+            }
+
+            # =========================================
+            # SUCCESS
+            # =========================================
+            elseif ($state -eq "Completed") {
+
+                $finalStatus = "SUCCESS"
+                $isFinished  = $true
+            }
+
+            # =========================================
+            # FAILED
+            # =========================================
+            elseif ($state -match "Failed") {
+
+                $finalStatus = "FAILED"
+                $isFinished  = $true
+            }
+
+            elseif ($state -match "Killed") {
+
+                $finalStatus = "FAILED"
+                $isFinished  = $true
+            }
+
+            # =========================================
+            # MAILBOX BASED DETECTION
+            # =========================================
+            elseif ($mailSuccess -eq 1 -and $ItemFailed -gt 0) {
+
+                $finalStatus = "COMPLETED_WITH_WARNING"
+                $isFinished  = $true
+            }
+
+            elseif ($mailSuccess -eq 1) {
+
+                $finalStatus = "SUCCESS"
+                $isFinished  = $true
+            }
+
+            elseif ($mailSkipped -eq 1) {
+
+                $finalStatus = "SKIPPED"
+                $isFinished  = $true
+            }
+
+            elseif ($mailFailed -eq 1) {
+
+                $finalStatus = "FAILED"
+                $isFinished  = $true
+            }
+
+            elseif ($state -eq "Pending" -and $percent -eq 100) {
+
+                $finalStatus = "SKIPPED"
+                $isFinished  = $true
+            }
+
+            $startTime = if ($startUnix -gt 0) {
+                [DateTimeOffset]::FromUnixTimeSeconds($startUnix).ToLocalTime()
+            }
+            else {
+                "N/A"
+            }
+
+            $endTime = if ($endUnix -gt 0) {
+                [DateTimeOffset]::FromUnixTimeSeconds($endUnix).ToLocalTime()
+            }
+            else {
+                "N/A"
+            }
+
+            # =========================================
+            # FINISHED
+            # =========================================
+            if ($isFinished) {
+
+                $line = "$($job.UserName) | Job=$($job.JobId) | Status=$finalStatus | Start=$startTime | End=$endTime | Reason=$reason"
+
+                switch ($finalStatus) {
+
+                    "SUCCESS" {
+
+                        Write-Log $SuccessLog "SUCCESS: $line"
+                    }
+
+                    "COMPLETED_WITH_WARNING" {
+
+                        Write-Log $WarningLog "WARNING: $line | ScanFileFailures=$ItemFailed"
+                    }
+
+                    "FAILED" {
+
+                        Write-Log $FailedLog "FAILED: $line"
+                    }
+
+                    "SKIPPED" {
+
+                        Write-Log $SkippedLog "SKIPPED: $line"
+                    }
+
+                    default {
+
+                        Write-Log $InfoLog "UNKNOWN: $line"
+                    }
+                }
+
+                # FORCE ARRAY
+                $activeJobs = @(
+                    $activeJobs | Where-Object {
+                        $_.JobId -ne $job.JobId
+                    }
+                )
+
+                continue
+            }
+
+            Write-Log $InfoLog "TRACKING: $($job.UserName) | Job=$($job.JobId) | Status=$state | Percent=$percent | ScanFileFailures=$ItemFailed"
+        }
+        catch {
+
+            if ($job.Retry -ge $maxRetries) {
+
+                Write-Log $FailedLog "ERROR: $($job.UserName) | Job=$($job.JobId) | Timeout"
+
+                # FORCE ARRAY
+                $activeJobs = @(
+                    $activeJobs | Where-Object {
+                        $_.JobId -ne $job.JobId
+                    }
+                )
+
+                continue
+            }
+
+            $job.Retry++
+        }
+    }
+
+    if ($activeJobs.Count -gt 0) {
+        Start-Sleep 30
+    }
+}
+
+Write-Log $InfoLog "All jobs completed!"
