@@ -1,18 +1,15 @@
-stage('Promote Test To Dev') {
+pipeline {
+    agent any
 
-    when {
-        branch 'test'
-    }
+    stages {
 
-    steps {
+        stage('Info') {
 
-        sh '''
-        git config user.email "jenkins@local"
-        git config user.name "Jenkins"
+            steps {
 
-        git checkout dev
-        git merge test
-        git push origin dev
-        '''
+                echo "Current branch: ${env.BRANCH_NAME}"
+
+            }
+        }
     }
 }
