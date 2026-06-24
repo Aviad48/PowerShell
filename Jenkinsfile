@@ -3,30 +3,50 @@ pipeline {
 
     stages {
 
-        stage('Build') {
+        stage('Deploy Local Folder') {
             steps {
-                echo "Building ${env.BRANCH_NAME}"
-            }
-        }
 
-        stage('Deploy') {
-            steps {
                 script {
 
-                    if (env.BRANCH_NAME == 'test') {
+                    def target = ""
 
-                        sh 'deploy-test.sh'
-
-                    } else if (env.BRANCH_NAME == 'dev') {
-
-                        sh 'deploy-dev.sh'
-
-                    } else if (env.BRANCH_NAME == 'main') {
-
-                        sh 'deploy-prod.sh'
+                    if (env.BRANCH_NAME == "test") {
+                        target = "/home/ubuntu/docker_volume/test"
                     }
+
+                    if (env.BRANCH_NAME == "dev") {
+                        target = "/home/ubuntu/docker_volume/dev"
+                    }
+
+                    if (env.BRANCH_NAME == "main") {
+                        target = "/home/ubuntu/docker_volume/main"
+                    }
+
+                    sh """
+                        mkdir -p ${target}
+
+                        rsync -av --delete \
+                        --exclude='.git' \
+                        ./ ${target}/
+                    """
                 }
             }
         }
+
+        stage('Approve Promotion') {
+
+            when {
+                anyOf {
+                    branch 'test'
+                    branch 'dev'
+                }
+            }
+
+            steps {
+
+                input message: "Approve promotion?"
+            }
+        }
+
     }
 }
