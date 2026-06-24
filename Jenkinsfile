@@ -11,16 +11,22 @@ pipeline {
 
                     def target = ""
 
-                    if (env.BRANCH_NAME == "test") {
-                        target = "/home/ubuntu/docker_volume/test"
-                    }
+                    switch(env.BRANCH_NAME) {
 
-                    if (env.BRANCH_NAME == "dev") {
-                        target = "/home/ubuntu/docker_volume/dev"
-                    }
+                        case "test":
+                            target = "/data/test"
+                            break
 
-                    if (env.BRANCH_NAME == "main") {
-                        target = "/home/ubuntu/docker_volume/main"
+                        case "dev":
+                            target = "/data/dev"
+                            break
+
+                        case "main":
+                            target = "/data/prod"
+                            break
+
+                        default:
+                            error("Unknown branch: ${env.BRANCH_NAME}")
                     }
 
                     echo "Deploying ${env.BRANCH_NAME} to ${target}"
@@ -29,8 +35,8 @@ pipeline {
                     mkdir -p ${target}
 
                     rsync -av --delete \
-                      --exclude='.git' \
-                      ./ ${target}/
+                        --exclude='.git' \
+                        ./ ${target}/
                     """
                 }
             }
